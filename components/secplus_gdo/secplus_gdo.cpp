@@ -26,6 +26,7 @@ namespace secplus_gdo {
     static const char* const TAG = "secplus_gdo";
 
     static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, void *arg) {
+        ESP_LOGV(TAG, "Entering gdo_event_handler");
         GDOComponent *gdo = static_cast<GDOComponent *>(arg);
         switch (event) {
         case GDO_CB_EVENT_SYNCED:
@@ -117,6 +118,7 @@ namespace secplus_gdo {
 
     void GDOComponent::setup() {
         // Set the toggle only state and control here because we cannot guarantee the cover instance was created before the switch
+        ESP_LOGV(TAG, "Entering ::setup()");
         this->door_->set_toggle_only(this->toggle_only_switch_->state);
         this->toggle_only_switch_->set_control_function(std::bind(&esphome::secplus_gdo::GDODoor::set_toggle_only,
                                                         this->door_, std::placeholders::_1));
@@ -153,6 +155,7 @@ namespace secplus_gdo {
     }
 
     void GDOComponent::set_sync_state(bool synced) {
+        ESP_LOGV(TAG, "Entering ::set_sync_state(%d)", synced);
         if (this->door_) {
             this->door_->set_sync_state(synced);
         }

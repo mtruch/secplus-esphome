@@ -151,7 +151,7 @@ namespace secplus_gdo {
     }
 
     void GDOComponent::dump_config() {
-        ESP_LOGCONFIG(TAG, "Setting up secplus GDO ...");
+        ESP_LOGCONFIG(TAG, "Setting up secplus GDO ... ::dump_config()");
     }
 
     void GDOComponent::set_sync_state(bool synced) {

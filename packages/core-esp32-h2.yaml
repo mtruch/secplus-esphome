@@ -1,0 +1,71 @@
+esphome:
+  name: $name
+  friendly_name: $friendly_name
+#  name_add_mac_suffix: true
+  min_version: '2024.12.0' # Includes ESP-IDF 5.1
+  project:
+    name: $project_name
+    version: $project_version
+  platformio_options:
+    board_build.flash_mode: dio
+  
+  on_boot:
+    - priority: 800.0
+      then:
+        - text_sensor.template.publish:
+            id: device_id
+            state: !lambda return get_mac_address();
+        - text_sensor.template.publish:
+            id: project_version
+            state: !lambda return ESPHOME_PROJECT_VERSION;
+    - priority: -100  #start_gdo() here as we don't have WiFi (it usually starts once WiFi is up)
+      then:
+        lambda: id(gdo_blaq).start_gdo();
+
+esp32:
+  board: esp32-h2-devkitm-1
+  variant: ESP32H2
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+
+substitutions:
+  status_led_inverted: "false"
+
+text_sensor:
+  - platform: template
+    name: Device ID
+    id: device_id
+    entity_category: diagnostic
+    update_interval: never
+  - platform: version
+    id: esphome_version
+    name: ESPHome Version
+    hide_timestamp: true
+  - platform: template
+    name: Project version
+    id: project_version
+    entity_category: diagnostic
+    update_interval: never
+
+sensor:
+  - platform: uptime
+    name: Uptime
+    id: uptime_sensor
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+    id: restart_button
+    entity_category: config
+
+#### 
+# OTA UPDATES - DISABLED FOR NOW
+# Enables over-the-air updates
+# more: https://esphome.io/components/ota.html
+#ota:
+#  - platform: esphome
+#    id: konnected_ota

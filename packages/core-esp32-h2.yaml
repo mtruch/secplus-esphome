@@ -30,6 +30,13 @@ esp32:
     version: recommended
     sdkconfig_options:
       CONFIG_LWIP_MAX_SOCKETS: "16"
+    advanced:
+      components:
+        - name: gdolib
+          source:
+            type: git
+            url: https://github.com/mtruch/gdolib.git
+            ref: master
 
 substitutions:
   status_led_inverted: "false"

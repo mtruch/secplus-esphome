@@ -6,9 +6,7 @@ esphome:
   project:
     name: $project_name
     version: $project_version
-  platformio_options:
-    board_build.flash_mode: dio
-  
+
   on_boot:
     - priority: 800.0
       then:

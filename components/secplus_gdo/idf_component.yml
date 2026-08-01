@@ -1,0 +1,4 @@
+dependencies:
+  gdolib:
+    git: https://github.com/mtruch/gdolib.git
+    path: .

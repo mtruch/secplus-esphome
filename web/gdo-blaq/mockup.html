@@ -52,7 +52,7 @@
   ];
   const byId = Object.fromEntries(ENT.map((e) => [e.id, e]));
   const byName = Object.fromEntries(ENT.map((e) => [e.name_id, e]));
-  const PING0 = { title: "GDO blaQ 692dec (mockup)", comment: "", ota: false, log: true, lang: "en", uptime: 339710 };
+  const PING0 = { title: "GDO blaQ 692dec (mockup)", comment: "", ota: true, log: true, lang: "en", uptime: 339710 };
 
   /* Real device quirk: incremental broadcasts are SLIM payloads —
      no domain/name/icon/entity_category. Mimic that here so the UI
@@ -62,6 +62,20 @@
     const s = { ...e };
     for (const k of SLIM_DROP) delete s[k];
     return s;
+  };
+
+  /* Wire format of the entity identifier. ESPHome 2026.1.3–2026.7.x send
+     `name_id` ("domain/Display Name") alongside the legacy `id`
+     ("domain-object_id"); 2026.8.0 drops `name_id` and `id` itself becomes
+     the name form. The snapshot above is stored in the older shape — flip
+     WIRE to "2026.7" to replay it verbatim, or "2026.8" to rewrite it on
+     the way out. Both must render identically. */
+  const WIRE = "2026.8"; // "2026.7" | "2026.8"
+  const wire = (e) => {
+    if (WIRE !== "2026.8") return e;
+    const w = { ...e, id: e.name_id };
+    delete w.name_id;
+    return w;
   };
 
   /* ---- Fake EventSource (auto-reconnects like the real one) ---- */
@@ -86,7 +100,7 @@
       if (this.onopen) this.onopen();
       // connect replay: ping + full entity states
       this._emit("ping", JSON.stringify(PING0));
-      for (const e of ENT) this._emit("state", JSON.stringify(e));
+      for (const e of ENT) this._emit("state", JSON.stringify(wire(e)));
     }
     _drop() {
       if (this.readyState === 2) return;
@@ -107,8 +121,10 @@
   /* ---- Simulator core ---- */
   const SIM = (window.SIM = {
     offline: false,
+    otaFail: false,
+    otaHttpError: false,
     broadcast(type, data) { for (const s of [...sources]) s._emit(type, typeof data === "string" ? data : JSON.stringify(data)); },
-    push(e) { this.broadcast("state", slim(e)); },
+    push(e) { this.broadcast("state", wire(slim(e))); },
     log(lvl, tag, msg) {
       const colors = { D: "36", I: "32", W: "33", E: "31" };
       this.broadcast("log", "\x1b[0;" + (colors[lvl] || "37") + "m[" + lvl + "][" + tag + "]: " + msg + "\x1b[0m");
@@ -213,6 +229,68 @@
     SIM.log("W", "gdo_cover:051", "[gdo_main_task] Door stopped at " + Math.round(door.position * 100) + "%");
     SIM.push(door);
   }
+
+  /* ---- Fake OTA upload endpoint ----
+     Real firmware answers HTTP 200 either way; the outcome is only in the body.
+     Served over XMLHttpRequest (not fetch) so `upload.onprogress` fires — that
+     is what drives the UI's progress bar. Non-/update XHRs pass through. ---- */
+  const OTA_UPLOAD_MS = 3000; // simulated transfer time, so progress is watchable
+  const OTA_FLASH_MS = 1200;  // device writing flash after the last byte lands
+  const RealXHR = window.XMLHttpRequest;
+  window.XMLHttpRequest = function FakeXHR() {
+    const listeners = { self: [], upload: [] };
+    let method = "GET", url = "";
+    const upload = {
+      addEventListener: (t, fn) => listeners.upload.push([t, fn]),
+    };
+    const emit = (bucket, target, type, ev) => {
+      listeners[bucket].forEach(([t, fn]) => { if (t === type) fn(Object.assign({ type: type, target: target }, ev)); });
+    };
+    const xhr = {
+      upload: upload,
+      status: 0,
+      responseText: "",
+      addEventListener: (t, fn) => listeners.self.push([t, fn]),
+      open: (m, u) => { method = m; url = u; },
+      setRequestHeader: () => {},
+      abort: () => emit("self", xhr, "abort", {}),
+      send: (body) => {
+        if (!(method.toUpperCase() === "POST" && url === "/update")) {
+          const real = new RealXHR();
+          listeners.self.forEach(([t, fn]) => real.addEventListener(t, fn));
+          listeners.upload.forEach(([t, fn]) => real.upload.addEventListener(t, fn));
+          real.open(method, url);
+          real.send(body);
+          return;
+        }
+        const f = body && body.get && body.get("update");
+        const total = (f && f.size) || 1835008; // ~1.8 MB, a realistic image
+        const t0 = performance.now();
+        const tick = () => {
+          const frac = Math.min(1, (performance.now() - t0) / OTA_UPLOAD_MS);
+          emit("upload", xhr, "progress", { lengthComputable: true, loaded: Math.floor(total * frac), total: total });
+          if (frac < 1) { setTimeout(tick, 100); return; }
+          emit("upload", xhr, "load", {});
+          setTimeout(() => {
+            xhr.status = 200;
+            if (SIM.otaHttpError) {
+              // Transport-level failure (multipart parse / recv timeout): the
+              // device answers non-2xx with an HTML error page, not a message.
+              SIM.otaHttpError = false;
+              xhr.status = 400;
+              xhr.responseText = "<html><head><title>400 Bad Request</title></head>" +
+                "<body><h1>400 Bad Request</h1></body></html>";
+            } else if (SIM.otaFail) { SIM.otaFail = false; xhr.responseText = "Update Failed!"; }
+            else { xhr.responseText = "Update Successful!"; }
+            emit("self", xhr, "load", {});
+            if (/Successful/.test(xhr.responseText)) SIM.reboot(6000);
+          }, OTA_FLASH_MS);
+        };
+        setTimeout(tick, 100);
+      },
+    };
+    return xhr;
+  };
 
   /* ---- REST action endpoints ---- */
   const realFetch = window.fetch.bind(window);
@@ -320,6 +398,8 @@
     });
     mk("error log line", () => SIM.log("E", "secplus_gdo:120", "Rolling code mismatch — resyncing"));
     mk("drop connection 3s", () => SIM.drop(3000));
+    mk("force OTA failure (next upload)", () => { SIM.otaFail = true; });
+    mk("force OTA HTTP 400 (next upload)", () => { SIM.otaHttpError = true; });
     document.body.appendChild(p);
   });
 })();

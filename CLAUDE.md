@@ -98,8 +98,24 @@ Production: the device's HTML shell loads the JS/CSS from the CDN URLs set by th
 substitution in `garage-door-GDOv2-Q.yaml`. Deploy with:
 
 ```bash
-scripts/deploy-web-ui.sh --dry-run     # show what would change
-scripts/deploy-web-ui.sh               # publish (prompts before uploading)
+scripts/deploy-web-ui.sh --dry-run                  # show what would change
+scripts/deploy-web-ui.sh --version vN               # publish (prompts before uploading)
+```
+
+Always pass `--version`: the default is `v1`, and snapshots are immutable, so a bare run just
+fails the conflict check. Use the next unused dir (`aws s3 ls s3://app.konnected.io/esp/gdo-blaq/`
+to see what's taken — v4 is current as of 2026-08-26).
+
+**Use the default AWS profile.** The `app.konnected.io` bucket lives in account
+`652695076726`, which is what an unset `AWS_PROFILE` resolves to. The
+`konnected-production-*` profiles are a *different* account (`684083964462`) and can read
+the bucket but not write it — so `--dry-run` passes and the real run then dies on the very
+first `PutObject` with `AccessDenied` (nothing partial gets written; the snapshot upload is
+the first step). Symptom to recognize:
+
+```
+An error occurred (AccessDenied) ... User: arn:aws:iam::684083964462:user/nate
+is not authorized to perform: s3:PutObject on .../esp/gdo-blaq/v4/www.js
 ```
 
 Assets live in the `app.konnected.io` S3 bucket behind CloudFront, scoped by platform and
@@ -142,9 +158,18 @@ document.body.appendChild(Object.assign(document.createElement("script"),
 
 ### ESPHome web server API facts the UI depends on
 
-- **Action URLs are built from the SSE `name_id` field** (`"cover/Garage Door"` →
-  `POST /cover/Garage%20Door/open`) with legacy object_id fallback — required for
-  ESPHome ≥ 2026.7 which removes slug URLs (see `openapi/migration-guide.md`).
+- **Entity identity is `name_id || id`, never `id` alone.** Both spell
+  `"{domain}/{Display Name}"`: ESPHome 2026.1.3–2026.7.x send `name_id` alongside a
+  legacy `id` (`"{domain}-{object_id}"`), and **2026.8.0 drops `name_id` and makes `id`
+  itself the name form** (see `openapi/migration-guide.md`). Reading `id` alone silently
+  breaks every object_id lookup on 2026.8 — issue #131: the safety strip and Device card
+  render empty while anything found by domain scan still works. `www.js` stores entities
+  under `name_id || id` and indexes them by the object_id slug it recomputes from the
+  display name (lowercase; anything outside `[a-z0-9_-]` → `_`, matching ESPHome's
+  `to_sanitized_char(to_snake_case_char(c))`). Action URLs come from the same pair
+  (`"cover/Garage Door"` → `POST /cover/Garage%20Door/open`).
+  `mockup.html` has a `WIRE` constant to replay either format — check both after
+  touching entity lookup.
 - **Incremental `state` broadcasts are slim payloads** — no `domain`/`name`/`entity_category`
   (only the connect replay has them). Always merge into stored entities, never replace.
 - **The connect replay can drop events** (small deferred queue, worse with multiple SSE

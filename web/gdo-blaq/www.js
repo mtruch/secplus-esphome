@@ -5,10 +5,11 @@
    consumes the unmodified ESPHome /events SSE stream and REST
    action endpoints.
 
-   Entity action URLs are built from the SSE `name_id` field
-   (display-name URL format, ESPHome >= 2026.1.3) with a
-   fallback to the legacy object_id slug in `id`, so the UI
-   works before and after the 2026.7 URL format change.
+   Entities are identified by the SSE `name_id || id` pair —
+   both spell "{domain}/{Display Name}" once one of them is
+   present, so the UI works before and after the 2026.7 URL
+   format change and the 2026.8 SSE `id` change. See the
+   "Entity identity" note below.
    ============================================================ */
 (() => {
   "use strict";
@@ -44,6 +45,7 @@
     plusBox: "M17,13H13V17H11V13H7V11H11V7H13V11H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z",
     // Device section: clear "device details" glyph (MDI information-outline)
     info: "M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z",
+    upload: "M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z",
   };
   const ic = (name) =>
     '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="' + ICONS[name] + '"/></svg>';
@@ -71,7 +73,8 @@
 
   /* ---------- State ---------- */
   const S = {
-    ent: Object.create(null), // entity id -> latest state event payload
+    ent: Object.create(null), // "domain/Display Name" -> latest state event payload
+    oid: Object.create(null), // "domain-object_id" -> the same objects, by slug
     title: document.title || "Konnected GDO",
     online: false,
     everConnected: false,
@@ -80,6 +83,7 @@
     logCount: 0,
     motionSeen: false, // this opener has reported motion at least once
     motionKey: "",
+    ota: false, // OTA-upload capability, from the SSE ping payload
   };
   let theme = "dark";
   try {
@@ -87,8 +91,29 @@
     if (t === "light" || t === "dark") theme = t;
   } catch (e) {}
 
-  const byId = (id) => S.ent[id] || null;
-  const objId = (e) => e.id.slice(e.domain.length + 1);
+  /* ---------- Entity identity ----------
+     Every payload carries the entity's "{domain}/{Display Name}" form: as
+     `name_id` next to the legacy `id` ("{domain}-{object_id}") on ESPHome
+     2026.1.3–2026.7.x, and as `id` itself from 2026.8.0, which drops
+     `name_id`. So `name_id || id` is the one identifier that means the same
+     thing on both sides of the change — and unlike `name`, it rides on the
+     slim state broadcasts too, not just the connect replay.
+
+     The UI matches on ESPHome's object_id slug, which it derives from the
+     display name: lowercase, and anything outside [a-z0-9_-] becomes "_"
+     (`to_sanitized_char(to_snake_case_char(c))`). Recomputing it here keeps
+     every `bSensor("wall_button")`-style lookup working no matter which
+     field the firmware sent. */
+  const keyOf = (e) => e.name_id || e.id;
+  const slug = (s) => s.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+  /* -> [domain, name]. Pre-2026.1.3 ids have no "/" and no display name;
+     split those on the stored domain and keep the object_id as the name. */
+  const splitKey = (e) => {
+    const k = keyOf(e), i = k.indexOf("/");
+    return i < 0 ? [k.slice(0, e.domain.length), k.slice(e.domain.length + 1)] : [k.slice(0, i), k.slice(i + 1)];
+  };
+  const objId = (e) => slug(splitKey(e)[1]);
+  const byId = (oidKey) => S.oid[oidKey] || null;
   const allOf = (domain) => {
     const out = [];
     for (const k in S.ent) if (S.ent[k].domain === domain) out.push(S.ent[k]);
@@ -158,17 +183,11 @@
     try { localStorage.setItem(motionKey(), "1"); } catch (e) {}
   }
 
-  /* Action URL from name_id (new display-name format, ESPHome >= 2026.1.3)
-     with legacy object_id fallback. */
+  /* Action URL: the display-name format (ESPHome >= 2026.1.3), or the legacy
+     object_id slug on older firmware — splitKey yields whichever we were given. */
   function actUrl(e, action) {
-    let seg;
-    if (e.name_id) {
-      const i = e.name_id.indexOf("/");
-      seg = e.name_id.slice(0, i) + "/" + encodeURIComponent(e.name_id.slice(i + 1));
-    } else {
-      seg = e.domain + "/" + objId(e);
-    }
-    return "/" + seg + (action ? "/" + action : "");
+    const p = splitKey(e);
+    return "/" + p[0] + "/" + encodeURIComponent(p[1]) + (action ? "/" + action : "");
   }
   const act = (e, action) => fetch(actUrl(e, action), { method: "POST" }).catch(() => {});
 
@@ -244,6 +263,19 @@
     '<div class="gdo-setbody" id="g-setbody" hidden>' +
     '<div id="g-rows" style="display:flex;flex-direction:column;gap:17px;"></div>' +
     '<div class="gdo-btngrid" id="g-btns"></div>' +
+    '<div class="gdo-ota" id="g-ota" hidden>' +
+    '<div class="gdo-ota-head">' + ic("upload") + "<span>Firmware update</span></div>" +
+    '<div class="gdo-ota-row">' +
+    '<input type="file" id="g-ota-input" accept=".bin" hidden>' +
+    '<button class="gdo-ghost" id="g-ota-choose">Choose file</button>' +
+    '<span class="gdo-ota-fname" id="g-ota-fname" hidden></span>' +
+    '<button class="gdo-ota-clear" id="g-ota-clear" hidden aria-label="Clear selected file">&times;</button>' +
+    '<button class="gdo-ghost" id="g-ota-upload" hidden>' + ic("upload") + " Upload firmware</button>" +
+    "</div>" +
+    '<div class="gdo-ota-prog" id="g-ota-prog" hidden role="progressbar" aria-label="Firmware upload progress" aria-valuemin="0" aria-valuemax="100">' +
+    '<div class="gdo-ota-prog-bar" id="g-ota-prog-bar"></div></div>' +
+    '<div class="gdo-ota-status" id="g-ota-status"></div>' +
+    "</div>" +
     "</div></section>" +
     // Logs
     '<section class="gdo-card gdo-sect" id="g-logs" hidden>' +
@@ -723,6 +755,149 @@
     return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   }
 
+  /* ---------- Firmware update (OTA) ---------- */
+  const otaInput = $("g-ota-input");
+  const otaChoose = $("g-ota-choose");
+  const otaClear = $("g-ota-clear");
+  const otaUpload = $("g-ota-upload");
+  const otaFname = $("g-ota-fname");
+  const otaStatus = $("g-ota-status");
+  const otaProg = $("g-ota-prog");
+  const otaProgBar = $("g-ota-prog-bar");
+  // otaBusy: controls are inert (upload running, or finished and waiting for the
+  // reboot). otaInFlight: the POST itself is still open — an SSE drop/reconnect
+  // during it must not tear down the progress UI.
+  let otaBusy = false;
+  let otaInFlight = false;
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / (1024 * 1024)).toFixed(1) + " MB";
+  }
+  function otaSetStatus(text, kind) {
+    otaStatus.textContent = text;
+    otaStatus.className = "gdo-ota-status" + (kind ? " " + kind : "");
+  }
+  // pct null => hide the bar; -1 => indeterminate (device is writing flash,
+  // the browser has no visibility into it); 0..100 => determinate.
+  function otaSetProgress(pct) {
+    if (pct == null) {
+      otaProg.hidden = true;
+      otaProg.classList.remove("is-indet");
+      otaProgBar.style.width = "0%";
+      otaProg.removeAttribute("aria-valuenow");
+      return;
+    }
+    otaProg.hidden = false;
+    if (pct < 0) {
+      otaProg.classList.add("is-indet");
+      otaProgBar.style.width = "100%";
+      otaProg.removeAttribute("aria-valuenow");
+    } else {
+      otaProg.classList.remove("is-indet");
+      otaProgBar.style.width = pct + "%";
+      otaProg.setAttribute("aria-valuenow", String(Math.round(pct)));
+    }
+  }
+  function otaReset() {
+    otaBusy = false;
+    otaSetProgress(null);
+    otaInput.value = "";
+    otaFname.hidden = true;
+    otaFname.textContent = "";
+    otaClear.hidden = true;
+    otaUpload.hidden = true;
+    otaChoose.hidden = false;
+    otaChoose.disabled = otaUpload.disabled = otaClear.disabled = false;
+    otaSetStatus("", "");
+  }
+  otaChoose.addEventListener("click", () => otaInput.click());
+  otaClear.addEventListener("click", () => { if (!otaBusy) otaReset(); });
+  otaInput.addEventListener("change", () => {
+    const f = otaInput.files && otaInput.files[0];
+    if (!f) return;
+    otaFname.hidden = false;
+    otaFname.textContent = f.name + " · " + fmtBytes(f.size);
+    otaClear.hidden = false;
+    otaUpload.hidden = false;
+    otaChoose.hidden = true;
+    otaSetStatus("", "");
+  });
+  otaUpload.addEventListener("click", () => {
+    const f = otaInput.files && otaInput.files[0];
+    if (!f || otaBusy) return;
+    otaBusy = true;
+    otaChoose.disabled = otaUpload.disabled = otaClear.disabled = true;
+    const total = f.size;
+
+    function otaProgressText(loaded) {
+      otaStatus.className = "gdo-ota-status";
+      otaStatus.innerHTML =
+        '<span class="gdo-ota-spin"></span><span id="g-ota-prog-txt"></span>';
+      const pct = total ? Math.floor((loaded / total) * 100) : 0;
+      $("g-ota-prog-txt").textContent =
+        "Uploading… " + pct + "% · " + fmtBytes(loaded) + " of " + fmtBytes(total);
+      otaSetProgress(total ? pct : -1);
+    }
+    function otaFail(msg) {
+      otaBusy = false;
+      otaInFlight = false;
+      otaChoose.disabled = otaUpload.disabled = otaClear.disabled = false;
+      otaSetProgress(null);
+      otaSetStatus(msg, "err");
+    }
+
+    otaProgressText(0);
+
+    const fd = new FormData();
+    fd.append("update", f);
+    const xhr = new XMLHttpRequest();
+    otaInFlight = true;
+    xhr.open("POST", "/update");
+    xhr.upload.addEventListener("progress", (e) => {
+      if (!otaBusy) return;
+      if (e.lengthComputable && e.loaded < e.total) otaProgressText(e.loaded);
+      else otaWriting();
+    });
+    // Bytes are all out the door but the ESP32 is still writing flash and has
+    // not answered yet — nothing left to measure, so go indeterminate.
+    function otaWriting() {
+      otaStatus.className = "gdo-ota-status";
+      otaStatus.innerHTML =
+        '<span class="gdo-ota-spin"></span><span>Writing to flash… do not power off the device</span>';
+      otaSetProgress(-1);
+    }
+    xhr.upload.addEventListener("load", () => { if (otaBusy) otaWriting(); });
+    xhr.addEventListener("load", () => {
+      otaInFlight = false;
+      const t = xhr.responseText || "";
+      // ESPHome's /update always answers 200 and encodes the outcome in the body.
+      // Anything else is a transport-level failure (multipart parse error, recv
+      // timeout) whose body is an HTML error page, not a message worth showing.
+      if (xhr.status < 200 || xhr.status >= 300) {
+        otaFail("Upload failed (HTTP " + xhr.status + ") — check the connection and try again");
+      } else if (/Update Successful/i.test(t)) {
+        otaSetProgress(100);
+        otaStatus.className = "gdo-ota-status ok";
+        otaStatus.textContent = "Update uploaded — device is rebooting";
+        // otaBusy stays true: controls stay inert until the post-reboot
+        // reconnect resets the block (see setOnline()).
+      } else {
+        otaFail(t || "Upload failed — check the file and try again");
+      }
+    });
+    xhr.addEventListener("error", () =>
+      otaFail("Upload failed — check your connection and try again"));
+    xhr.addEventListener("abort", () =>
+      otaFail("Upload cancelled"));
+    xhr.send(fd);
+  });
+
+  function renderOta() {
+    $("g-ota").hidden = !S.ota;
+  }
+
   /* ---------- Logs ---------- */
   const LVL = { V: "VERBOSE", D: "DEBUG", C: "CONFIG", I: "INFO", W: "WARN", E: "ERROR" };
   const MAX_LOGS = 300;
@@ -771,6 +946,7 @@
       renderSafety();
       renderDevice();
       renderSettings();
+      renderOta();
     });
   }
 
@@ -780,18 +956,19 @@
      entity rather than replacing it. */
   function ingest(d, onlyNew) {
     if (!d || !d.id) return false;
-    const prev = S.ent[d.id];
+    const key = keyOf(d);
+    const prev = S.ent[key];
     if (prev && onlyNew) return false;
     if (!d.domain) {
-      d.domain =
-        (d.name_id && d.name_id.slice(0, d.name_id.indexOf("/"))) ||
-        (prev && prev.domain) ||
-        d.id.split("-")[0];
+      const i = key.indexOf("/");
+      d.domain = (i > 0 && key.slice(0, i)) || (prev && prev.domain) || d.id.split("-")[0];
     }
-    S.ent[d.id] = prev ? Object.assign(prev, d) : d;
+    const e = prev ? Object.assign(prev, d) : d;
+    S.ent[key] = e;
+    S.oid[e.domain + "-" + objId(e)] = e;
     // A motion frame is the only proof that a motion sensor exists (see the
     // availability notes above); latch it before the tile is rendered.
-    if (d.id === "binary_sensor-motion" && d.value === true) noteMotion();
+    if (e.domain === "binary_sensor" && objId(e) === "motion" && d.value === true) noteMotion();
     return true;
   }
   const source = new EventSource("/events");
@@ -806,6 +983,10 @@
         const p = JSON.parse(ev.data);
         if (p.title) S.title = p.title;
         if (p.log) $("g-logs").hidden = false;
+        if (typeof p.ota === "boolean" && p.ota !== S.ota) {
+          S.ota = p.ota;
+          scheduleRender();
+        }
       } catch (e) {}
     }
     setOnline(true);
@@ -816,6 +997,9 @@
   function setOnline(v) {
     if (v) {
       if (!S.everConnected) setTimeout(backfill, 4000);
+      // Reset only on a genuine reconnect after the post-upload reboot — never
+      // while the POST is still open (the SSE stream can drop mid-flash).
+      else if (otaBusy && !otaInFlight && !S.online) otaReset();
       S.everConnected = true;
     }
     if (S.online === v) return;
